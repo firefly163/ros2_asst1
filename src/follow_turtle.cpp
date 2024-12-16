@@ -4,102 +4,161 @@
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
 #include "tf2/exceptions.h"
+#include <vector>
+#include <cmath>
 
-class node: public rclcpp::Node
+class FollowerNode : public rclcpp::Node
 {
 private:
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr publisher_;
-    rclcpp::TimerBase::SharedPtr timer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::string target,catcher;
-    bool reach_flag;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_publisher_;
+    rclcpp::TimerBase::SharedPtr control_timer_;
+    std::shared_ptr<tf2_ros::TransformListener> transform_listener_;
+    std::unique_ptr<tf2_ros::Buffer> transform_buffer_;
+    std::string leader_frame_, follower_frame_;
+    bool goal_reached_;
 
-    // Well, these two variables are not used in the code, but they may help in the task
-    bool inital_flag;
-    geometry_msgs::msg::TransformStamped tf_inital;
+    struct PIDParams {
+        double kp, ki, kd;
+    };
 
-    void timer_callback()
+    PIDParams linear_pid_{4.0, 0.0, 0.5};
+    PIDParams angular_pid_{4.0, 0.0, 1.0};
+    double linear_error_previous_, angular_error_previous_;
+    double linear_error_integral_, angular_error_integral_;
+
+    struct RelativePose {
+        double x, y, theta;
+    };
+
+    RelativePose desired_pose_{0.0, 0.0, 0.0};
+
+    double normalize_angle(double angle) const
     {
+        while (angle > M_PI) angle -= 2 * M_PI;
+        while (angle < -M_PI) angle += 2 * M_PI;
+        return angle;
+    }
 
-        geometry_msgs::msg::TransformStamped tf;     
+    double compute_pid(double error, double& error_integral, double& error_previous, const PIDParams& params)
+    {
+        error_integral += error;
+        double derivative = error - error_previous;
+        error_previous = error;
+        return params.kp * error + params.ki * error_integral + params.kd * derivative;
+    }
+
+    void control_loop()
+    {
+        geometry_msgs::msg::TransformStamped transform;
         try
         {
-            tf = tf_buffer_->lookupTransform(catcher, target, tf2::TimePointZero);
-
-        } catch (tf2::TransformException &ex)
+            transform = transform_buffer_->lookupTransform(follower_frame_, leader_frame_, tf2::TimePointZero);
+        }
+        catch (tf2::TransformException &ex)
         {
-            RCLCPP_ERROR(this->get_logger(), "Could not transform %s to %s: %s", catcher.c_str(), target.c_str(), ex.what());
+            RCLCPP_WARN(this->get_logger(), "Transform lookup failed: %s", ex.what());
             return;
         }
 
-        // now the code was implemented to make the catcher follow the target
-        // you should modify it to keep the relative position and orientation between the target and the catcher
-        // you can first try to make the catcher keep a fixed distance from the target
-        // then you can try to make the catcher keep a fixed angle from the target
-        // these two tasks are not easy, but you can do it!
+        double error_x = transform.transform.translation.x - desired_pose_.x;
+        double error_y = transform.transform.translation.y - desired_pose_.y;
+        double linear_error = hypot(error_x, error_y);
+        double target_theta = atan2(error_y, error_x);
+        double angular_error = normalize_angle(target_theta - desired_pose_.theta);
 
-        auto t = tf.transform;
-        auto message = geometry_msgs::msg::Twist();
-
-        if (hypot(t.translation.x, t.translation.y) < 0.1)
+        if (linear_error < 0.1)
         {
-            message.linear.x = 0.0;
-            message.angular.z = 0.0;
-            publisher_->publish(message);
-            if (!reach_flag) RCLCPP_INFO(this->get_logger(), "Reached target");
-            reach_flag = true;
+            goal_reached_ = true;
+            publish_velocity(0.0, 0.0);
             return;
         }
-        else
-        {
-            reach_flag = false;
-        }
 
-        message.linear.x = 0.5 * hypot(t.translation.x, t.translation.y);
-        message.angular.z = 1.0 * atan2(t.translation.y, t.translation.x);
-        RCLCPP_INFO(this->get_logger(), "Publishing: linear.x: '%f', angular.z: '%f'", message.linear.x, message.angular.z);
-        publisher_->publish(message);
+        goal_reached_ = false;
 
+        double linear_speed = compute_pid(linear_error, linear_error_integral_, linear_error_previous_, linear_pid_);
+        double angular_speed = compute_pid(angular_error, angular_error_integral_, angular_error_previous_, angular_pid_);
+
+        double max_linear_speed = 2.0;
+        double max_angular_speed = 2.0;
+
+        linear_speed = std::clamp(linear_speed, -max_linear_speed, max_linear_speed);
+        angular_speed = std::clamp(angular_speed, -max_angular_speed, max_angular_speed);
+
+        publish_velocity(linear_speed, angular_speed);
     }
-public: 
-    node(std::string target, std::string catcher): Node("follower"), target(target), catcher(catcher)
+
+    void publish_velocity(double linear, double angular)
     {
-        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-        timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(100),
-            std::bind(&node::timer_callback, this));
-        publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(catcher+"/cmd_vel", 10);
-        RCLCPP_INFO(this->get_logger(), "Hello, world");   
+        geometry_msgs::msg::Twist velocity_message;
+        velocity_message.linear.x = linear;
+        velocity_message.angular.z = angular;
+        velocity_publisher_->publish(velocity_message);
+        RCLCPP_INFO(this->get_logger(), "Velocity published: linear=%f, angular=%f", linear, angular);
     }
-    ~node()
+
+public:
+    FollowerNode(const std::string& leader_frame, const std::string& follower_frame, double relative_x, double relative_y, double relative_theta)
+        : Node("follower_node"),
+          leader_frame_(leader_frame), follower_frame_(follower_frame),
+          desired_pose_{relative_x, relative_y, relative_theta},
+          goal_reached_(false),
+          linear_error_previous_(0.0), angular_error_previous_(0.0),
+          linear_error_integral_(0.0), angular_error_integral_(0.0)
     {
-        RCLCPP_INFO(this->get_logger(), "Goodbye, world");
+        transform_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        transform_listener_ = std::make_shared<tf2_ros::TransformListener>(*transform_buffer_);
+
+        velocity_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(follower_frame + "/cmd_vel", 10);
+        control_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(&FollowerNode::control_loop, this));
+
+        RCLCPP_INFO(this->get_logger(), "FollowerNode for %s -> %s initialized", leader_frame.c_str(), follower_frame.c_str());
+    }
+
+    ~FollowerNode()
+    {
+        RCLCPP_INFO(this->get_logger(), "FollowerNode destroyed");
     }
 };
 
-class ROS_EVENT_LOOP
+class EventLoop
 {
 public:
-    ROS_EVENT_LOOP(int argc, char *argv[], std::string target,std::string catcher)
+    EventLoop(int argc, char* argv[], const std::string& leader_frame, const std::vector<std::string>& followers)
     {
         rclcpp::init(argc, argv);
-        rclcpp::spin(std::make_shared<node>(target,catcher));
+        rclcpp::executors::SingleThreadedExecutor executor;
+        std::vector<FollowerNode::RelativePose> relative_poses = {
+            {1.0, 0.0, 0.0}, {0.5, 0.5, M_PI / 4}, {0.5, -0.5, -M_PI / 4}
+        };
+
+        for (size_t i = 0; i < followers.size(); ++i)
+        {
+            auto node = std::make_shared<FollowerNode>(
+                leader_frame, followers[i],
+                relative_poses[i].x, relative_poses[i].y, relative_poses[i].theta);
+            executor.add_node(node);
+        }
+
+        executor.spin();
     }
-    ~ROS_EVENT_LOOP()
+
+    ~EventLoop()
     {
         rclcpp::shutdown();
     }
 };
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    if (argc != 3 )
+    if (argc < 3)
     {
-        RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "usage: follow target catcher");
+        RCLCPP_ERROR(rclcpp::get_logger("rclcpp"), "Usage: follow leader follower1 [follower2 ...]");
         return 1;
     }
-    ROS_EVENT_LOOP(argc, argv, argv[1], argv[2]);
+
+    std::string leader_frame = argv[1];
+    std::vector<std::string> followers(argv + 2, argv + argc);
+
+    EventLoop(argc, argv, leader_frame, followers);
     return 0;
 }
